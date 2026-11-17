@@ -1,0 +1,32 @@
+# Example gpu-ab adapter for sam3rs (https://github.com/avencera/sam3rs); replace the
+# /path/to/ path with your own
+#
+# Bench binary: cargo build --release --features cli --example bench, with
+# examples/bench.rs patched to take --outputs and write each prompt's last result there
+# (it otherwise drops every result, leaving nothing to fingerprint); build both arms with
+# the same patch
+# Metric: osam protocol on dogs.jpg, median of 5 after one warmup, in ms (0.1 ms resolution)
+# Fingerprint: sha256 of the last timed call of each prompt (scores, boxes, DETR queries,
+# masks), run on the last timed embedding, so these benches require bit-identical output.
+# Precision changes need a parity gate instead of the hash
+
+name = "sam3rs"
+repo = "/path/to/sam3rs"
+
+[bench.bf16-encode]
+description = "BF16 image encode, dogs.jpg, identical outputs"
+argv = ["{bin}", "--precision", "bf16", "--outputs", "{out}/outputs.bin"]
+metric = { name = "BF16 encode", unit = "ms", better = "lower", regex = '(?m)^\| sam3rs \S+ \| ([0-9.]+) \|' }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/outputs.bin"] }
+
+[bench.bf16-box]
+description = "BF16 box prompt, dogs.jpg, identical outputs"
+argv = ["{bin}", "--precision", "bf16", "--outputs", "{out}/outputs.bin"]
+metric = { name = "BF16 box", unit = "ms", better = "lower", regex = '(?m)^\| sam3rs \S+ \| [0-9.]+ \| [0-9.]+ \| ([0-9.]+) \|' }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/outputs.bin"] }
+
+[bench.fp32-encode]
+description = "FP32 image encode, dogs.jpg, identical outputs"
+argv = ["{bin}", "--precision", "fp32", "--outputs", "{out}/outputs.bin"]
+metric = { name = "FP32 encode", unit = "ms", better = "lower", regex = '(?m)^\| sam3rs \S+ \| ([0-9.]+) \|' }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/outputs.bin"] }

@@ -1,0 +1,32 @@
+# Template gpu-ab adapter: copy it to ~/.config/gpu-ab/adapters/<name>.toml (or wherever
+# GPU_AB_ADAPTERS points) and replace the /path/to/ paths. The README's "Adapter format"
+# documents every field
+
+# used in job names and log entries; also the name `--adapter` looks up
+name = "mybench"
+# absolute; {repo} expands to it, and it is the default working directory
+repo = "/path/to/mybench"
+
+# one table per bench, picked with --bench (optional when there is only one)
+[bench.throughput]
+description = "batch 8 decode, 512 tokens, identical outputs"
+# no shell; {bin} is the frozen --ctl or --exp file, and {out} an empty per-arm directory
+argv = ["{bin}", "--batch", "8", "--tokens", "512", "--out", "{out}/outputs.json"]
+# cwd = "{repo}"
+# env = { RUST_LOG = "info" }
+
+# the timed number; `regex` reads its first capture group from stdout by default, or use
+# `file` with `json`, a JSON pointer such as "/tokens_per_s"
+metric = { name = "decode tok/s", unit = "tok/s", better = "higher", regex = 'decode: ([0-9.]+) tok/s' }
+
+# every arm's output must hash the same as the first control arm's; keep paths out of the
+# hash command's output, and pass paths as arguments so spaces in them stay safe
+fingerprint = { hash = ["sh", "-c", "sha256sum < \"$1\"", "sh", "{out}/outputs.json"] }
+
+# the same bench for changes that may move outputs within limits: a gate command that
+# compares this arm's output with the control's and exits nonzero past your tolerance
+[bench.throughput-gated]
+description = "batch 8 decode, 512 tokens, outputs within tolerance of the control's"
+argv = ["{bin}", "--batch", "8", "--tokens", "512", "--out", "{out}/outputs.json"]
+metric = { name = "decode tok/s", unit = "tok/s", better = "higher", regex = 'decode: ([0-9.]+) tok/s' }
+fingerprint = { gate = ["/path/to/compare.py", "{ctl_out}/outputs.json", "{out}/outputs.json"] }

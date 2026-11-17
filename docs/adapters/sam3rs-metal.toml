@@ -1,0 +1,49 @@
+# Example gpu-ab adapter for the sam3rs Metal backend on Apple silicon
+# (https://github.com/avencera/sam3rs); the CUDA one is sam3rs.toml. Replace the /path/to/
+# path with your own
+#
+# Bench binaries, from the metal-backend branch (sam3rs PR #17) on macOS, with
+# examples/bench.rs patched to take --outputs as in sam3rs.toml:
+#   cargo build --release --example bench --example bench_video
+# then copy target/release/examples/bench and bench_video out of target/ before preparing.
+# Without the patch, --outputs writes one extra encode and one extra call per prompt after
+# timing, so the fingerprint wouldn't cover the calls that were timed
+# The MSL kernels are compiled into the binary (include_str!), so the frozen copy is the
+# whole program; Metal's shader cache makes only the first arm of each binary compile them,
+# and the warmup arms absorb that
+#
+# Encode and click: examples/bench, osam protocol on dogs.jpg, one warmup then the median
+# of --repeat calls, in ms at two decimals. With the patch, --outputs writes the last timed
+# call of each prompt, run on the last timed embedding, and every arm must match it bit for bit
+# Video: examples/bench_video on horses 720p (64 frames, 3 clicked objects), steady state
+# = median frame time over frames 8 onward of the second run (the first warms up); its
+# --outputs writes the last run's scores and masks
+#
+# Use --adapter with this file's path: `--adapter sam3rs` finds the CUDA adapter.
+# Measure A/A noise on the Mac before trusting a verdict; see the README's Apple silicon notes
+
+name = "sam3rs-metal"
+repo = "/path/to/sam3rs"
+
+[bench.bf16-encode]
+description = "Metal BF16 image encode, dogs.jpg, identical outputs"
+argv = ["{bin}", "--precision", "bf16", "--outputs", "{out}/outputs.bin"]
+metric = { name = "Metal BF16 encode", unit = "ms", better = "lower", regex = '(?m)^\| sam3rs \S+ \| ([0-9.]+) \|' }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/outputs.bin"] }
+
+# a click is about 6 ms and GPU-bound; 21 calls a median, as the CUDA prompt benches use
+[bench.bf16-click]
+description = "Metal BF16 point prompt (one click), dogs.jpg, median of 21, identical outputs"
+argv = ["{bin}", "--precision", "bf16", "--repeat", "21", "--outputs", "{out}/outputs.bin"]
+metric = { name = "Metal BF16 click", unit = "ms", better = "lower", regex = '(?m)^\| sam3rs \S+ \| [0-9.]+ \| ([0-9.]+) \|' }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/outputs.bin"] }
+
+# bench_video, not bench: prepare this one with the bench_video binaries
+[bench.bf16-video]
+description = "Metal BF16 video tracker, horses 720p, 3 objects, steady frame time, identical outputs"
+argv = ["{bin}", "--precision", "bf16", "--frames", "models/video-frames/horses-720p-64", "--clip", "horses",
+        "--objects", "3", "--runs", "2", "--outputs", "{out}"]
+metric = { name = "Metal BF16 video frame", unit = "ms", better = "lower", regex = '(?m)^run 1: .* steady ([0-9.]+) ms' }
+# one sha256sum per file: a missing file fails the redirect, where cat | sha256sum would
+# still hash whatever cat printed and succeed
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/outputs.json && sha256sum < {out}/masks.bin"] }

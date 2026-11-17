@@ -1,0 +1,37 @@
+# Example gpu-ab adapter for scriptrs (https://github.com/avencera/scriptrs); replace the
+# /path/to/ paths with your own
+#
+# Bench binary: cargo build --release --features cuda,long-form --example cuda_bench
+# Metric: wall seconds of the second (warm) pass over LibriSpeech test-clean, FP16 v3.
+# The first pass builds per-shape caches, so it's run but not timed
+# Fingerprint: sha256 of the transcripts, so these benches require identical output
+# (refactors, scheduling, host work). ls-b1-wer gates each arm on LibriSpeech WER instead,
+# for arithmetic changes, through wer_gate.py, your own script that is not part of gpu-ab;
+# the Earnings-21 and multilingual checks in scriptrs's README still apply
+
+name = "scriptrs"
+repo = "/path/to/scriptrs"
+
+[bench.ls-b1]
+description = "LibriSpeech test-clean b1 FP16 v3, warm pass wall, identical transcripts"
+argv = ["{bin}", "--models", "/path/to/models/scriptrs-native", "--version", "v3", "--repeats", "2", "--out", "{out}/ls.json"]
+metric = { name = "LS b1 warm wall", unit = "s", better = "lower", file = "{out}/ls.json", json = "/walls_s/1" }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/ls.texts.json"] }
+
+[bench.ls-b8]
+description = "LibriSpeech test-clean b8 queue FP16 v3, warm pass wall, identical transcripts"
+argv = ["{bin}", "--models", "/path/to/models/scriptrs-native", "--version", "v3", "--queue", "--batch", "8", "--repeats", "2", "--out", "{out}/ls.json"]
+metric = { name = "LS b8 warm wall", unit = "s", better = "lower", file = "{out}/ls.json", json = "/walls_s/1" }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/ls.texts.json"] }
+
+[bench.e21-call]
+description = "Earnings-21 call 4360674 (long form) FP16 v3, warm pass wall, identical transcript"
+argv = ["{bin}", "--models", "/path/to/models/scriptrs-native", "--version", "v3", "--long", "/path/to/earnings21/wav/4360674.wav", "--repeats", "2", "--out", "{out}/e21.json"]
+metric = { name = "E21 call warm wall", unit = "s", better = "lower", file = "{out}/e21.json", json = "/walls_s/1" }
+fingerprint = { hash = ["sh", "-c", "sha256sum < {out}/e21.texts.json"] }
+
+[bench.ls-b1-wer]
+description = "LibriSpeech test-clean b1 FP16 v3, warm pass wall, gated on LibriSpeech WER within +0.02 points"
+argv = ["{bin}", "--models", "/path/to/models/scriptrs-native", "--version", "v3", "--repeats", "2", "--out", "{out}/ls.json"]
+metric = { name = "LS b1 warm wall", unit = "s", better = "lower", file = "{out}/ls.json", json = "/walls_s/1" }
+fingerprint = { gate = ["python3", "-I", "/path/to/wer_gate.py", "{repo}", "{ctl_out}/ls.texts.json", "{out}/ls.texts.json"] }

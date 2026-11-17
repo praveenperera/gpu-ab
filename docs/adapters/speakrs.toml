@@ -1,0 +1,48 @@
+# Example gpu-ab adapter for speakrs (https://github.com/avencera/speakrs); replace the
+# /path/to/ paths with your own
+#
+# Bench binary: cargo build --release -p xtask --bin speakrs-bm --no-default-features --features cuda-rtx50
+# Metric: speakrs-bm wall seconds on all 216 VoxConverse dev files, model load excluded
+# Fingerprint: sha256 of every RTTM, so the default benches require identical output.
+# For arithmetic changes, use the *-der benches instead. Their gate, der_gate.py (your own
+# script, not part of gpu-ab), takes the control's and the arm's output directories and
+# exits nonzero when the DER limits in the bench description are broken
+
+name = "speakrs"
+repo = "/path/to/speakrs"
+
+[bench.sg]
+description = "Cuda (1 s step), VoxConverse dev, 216 files, identical RTTMs"
+argv = ["{bin}", "--dataset", "voxconverse-dev", "--impls", "sg", "--models", "local",
+        "--models-dir", "{repo}/fixtures/models", "--datasets-dir", "{repo}/fixtures/datasets",
+        "--root", "{repo}", "--no-preflight"]
+env = { RUST_LOG = "speakrs=info", SPEAKRS_RESULTS_DIR = "{out}" }
+metric = { name = "Cuda wall", unit = "s", better = "lower", file = "{out}/*/results.json", json = "/implementations/cuda/measurement/time_seconds" }
+fingerprint = { hash = ["sh", "-c", "cat {out}/*/hypotheses/*/*.rttm | sha256sum"] }
+
+[bench.sgf]
+description = "CudaFast (2 s step), VoxConverse dev, 216 files, identical RTTMs"
+argv = ["{bin}", "--dataset", "voxconverse-dev", "--impls", "sgf", "--models", "local",
+        "--models-dir", "{repo}/fixtures/models", "--datasets-dir", "{repo}/fixtures/datasets",
+        "--root", "{repo}", "--no-preflight"]
+env = { RUST_LOG = "speakrs=info", SPEAKRS_RESULTS_DIR = "{out}" }
+metric = { name = "CudaFast wall", unit = "s", better = "lower", file = "{out}/*/results.json", json = "/implementations/cuda-fast/measurement/time_seconds" }
+fingerprint = { hash = ["sh", "-c", "cat {out}/*/hypotheses/*/*.rttm | sha256sum"] }
+
+[bench.sg-der]
+description = "Cuda, 216 files, gated on |dDER| <= 0.01 and no file worse by more than 0.5 points"
+argv = ["{bin}", "--dataset", "voxconverse-dev", "--impls", "sg", "--models", "local",
+        "--models-dir", "{repo}/fixtures/models", "--datasets-dir", "{repo}/fixtures/datasets",
+        "--root", "{repo}", "--no-preflight"]
+env = { RUST_LOG = "speakrs=info", SPEAKRS_RESULTS_DIR = "{out}" }
+metric = { name = "Cuda wall", unit = "s", better = "lower", file = "{out}/*/results.json", json = "/implementations/cuda/measurement/time_seconds" }
+fingerprint = { gate = ["python3", "-I", "/path/to/der_gate.py", "{ctl_out}", "{out}"] }
+
+[bench.sgf-der]
+description = "CudaFast, 216 files, gated on |dDER| <= 0.01 and no file worse by more than 0.5 points"
+argv = ["{bin}", "--dataset", "voxconverse-dev", "--impls", "sgf", "--models", "local",
+        "--models-dir", "{repo}/fixtures/models", "--datasets-dir", "{repo}/fixtures/datasets",
+        "--root", "{repo}", "--no-preflight"]
+env = { RUST_LOG = "speakrs=info", SPEAKRS_RESULTS_DIR = "{out}" }
+metric = { name = "CudaFast wall", unit = "s", better = "lower", file = "{out}/*/results.json", json = "/implementations/cuda-fast/measurement/time_seconds" }
+fingerprint = { gate = ["python3", "-I", "/path/to/der_gate.py", "{ctl_out}", "{out}"] }
