@@ -1,0 +1,85 @@
+# Publish the release binary when a version tag is pushed
+#
+#   just release github
+#
+# Asset names match install.sh:
+#   gpu-ab-<tag>-x86_64-unknown-linux-musl.tar.gz
+#   gpu-ab-<tag>-aarch64-apple-darwin.tar.gz
+#
+# gpu-ab runs on the x86_64 Linux NVIDIA hosts and on Apple silicon Macs. musl makes the Linux
+# binary static, so the copy `gpu-ab prepare` freezes into a run directory runs in any queue job
+# regardless of its glibc
+
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      # stay a draft until every asset uploads, so install.sh never sees a latest release that
+      # is missing its binary or itself
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1.11.0
+        with:
+          draft: true
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        with:
+          bin: gpu-ab
+          package: gpu-ab
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          tar: unix
+          checksum: sha256
+          locked: true
+
+  upload-install-script:
+    needs: create-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Upload install.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" install.sh --clobber
+
+  publish-release:
+    needs: [upload-assets, upload-install-script]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
