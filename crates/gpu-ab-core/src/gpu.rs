@@ -13,7 +13,7 @@ mod ioreport;
 #[cfg(not(target_os = "macos"))]
 mod nvidia;
 
-pub use apple::{AppleArm, AppleState};
+pub use apple::{AppleArm, AppleState, BenchSampler};
 
 /// Throttle-reason bits that mean the GPU slowed itself down: hardware slowdown, software
 /// and hardware thermal slowdown, and the hardware power brake

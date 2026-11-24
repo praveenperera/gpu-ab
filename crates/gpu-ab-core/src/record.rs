@@ -64,7 +64,7 @@ pub struct ArmRecord {
     /// Whether the gate passed; `None` when the bench has no gate
     pub gate_passed: Option<bool>,
     /// False when another process was on the GPU before or after the arm, or, on Apple
-    /// silicon, used it during the arm
+    /// silicon, used it during an arm whose bench used the GPU itself
     pub valid: bool,
     pub invalid_reason: Option<String>,
     pub gpu_before: GpuSnapshot,
@@ -440,6 +440,13 @@ impl RunResult {
 
         if let Some((_, hi)) = range(arms.iter().map(|a| a.other_share)) {
             parts.push(format!("other GPU users <= {}", pct(hi)));
+        }
+
+        let idle = arms.iter().filter(|a| !a.used_gpu()).count();
+        if idle > 0 {
+            parts.push(format!(
+                "{idle} arms used no GPU, so other GPU users didn't count against them"
+            ));
         }
 
         if let Some((_, hi)) = range(arms.iter().map(|a| a.window_server_share)) {
