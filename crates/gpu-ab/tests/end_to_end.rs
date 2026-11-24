@@ -104,7 +104,8 @@ const FAKE_BUSY: &str = "4242 /usr/bin/other job";
 enum Work<'a> {
     /// Nothing, so the arm takes a few milliseconds
     Instant,
-    /// Half a second without the GPU
+    /// Half a second without the GPU; only the macOS tests time CPU-only arms
+    #[cfg(target_os = "macos")]
     Cpu,
     /// Half a second on the fake GPU in a child process, which writes its pid to this file
     /// and closes its client before the bench exits, as a real GPU bench's worker does
@@ -116,6 +117,7 @@ enum Work<'a> {
 fn bench_script(base: &str, text: &str, work: Work) -> String {
     let work = match work {
         Work::Instant => String::new(),
+        #[cfg(target_os = "macos")]
         Work::Cpu => "sleep 0.5\n".to_owned(),
         Work::Gpu(pid_file) => {
             let f = pid_file.display();
