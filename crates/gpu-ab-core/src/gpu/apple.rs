@@ -54,9 +54,10 @@ pub struct BenchClients {
 /// same in both arms
 ///
 /// A client closes when its process exits, which is before the reading after the arm, so
-/// only readings taken during the arm see the bench's own GPU time. GPU work in the last
-/// interval before the bench exits is missed, which can't hide a GPU arm: one that used
-/// the GPU only in its final second spent too little of it to be slowed much
+/// only readings taken during the arm see the bench's own GPU time. A reading sees only
+/// the clients open at that moment, so GPU work done entirely by child processes that start
+/// and exit between two readings is missed, and the arm counts as using no GPU; a bench
+/// whose GPU process lives through most of the arm is always seen
 pub struct BenchSampler {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<BenchClients>>,
