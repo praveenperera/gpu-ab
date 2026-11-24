@@ -14,7 +14,7 @@ use regex::Regex;
 
 use crate::{
     adapter::{MetricSpec, Vars},
-    gpu::{self, AppleArm, GpuSnapshot},
+    gpu::{self, AppleArm, BenchSampler, GpuSnapshot},
     plan::Plan,
     record::{ArmRecord, RunResult, Status},
     schedule::{Arm, Slot, abba},
@@ -151,9 +151,10 @@ fn run_arm(result: &RunResult, slot: &Slot, reference: &mut Option<Reference>) -
         .stderr(File::create(&stderr_path)?)
         .spawn()
         .wrap_err_with(|| format!("starting {:?} in {}", argv[0], cwd.display()))?;
-    let bench_pid = child.id();
+    let sampler = BenchSampler::start(child.id());
     let status = child.wait().wrap_err_with(|| format!("waiting for {:?}", argv[0]))?;
     let wall_s = started.elapsed().as_secs_f64();
+    let bench_clients = sampler.finish();
     let gpu_after = gpu::snapshot()?;
     let apple = match (&gpu_before.apple, &gpu_after.apple) {
         (Some(before), Some(after)) => {
@@ -162,7 +163,7 @@ fn run_arm(result: &RunResult, slot: &Slot, reference: &mut Option<Reference>) -
                 .as_ref()
                 .and_then(|e| e.gpus.first())
                 .and_then(|g| g.pstates_mhz.as_deref());
-            Some(AppleArm::between(before, after, wall_s, Some(bench_pid), pstates))
+            Some(AppleArm::between(before, after, wall_s, &bench_clients, pstates))
         }
         _ => None,
     };

@@ -25,7 +25,8 @@ exit 0
 /// WindowServer gains 10 s of GPU time per call, far more than any arm lasts, and must not
 /// invalidate anything; with `FAKE_GPU_BUSY`, another process gains as much and must. With
 /// `FAKE_GPU_DROP`, a process keeps submitting while its GPU time goes down, as when it
-/// closes a command queue, which must also invalidate the arm
+/// closes a command queue, which must also invalidate the arm. While a GPU bench runs, its
+/// pid is in `bench.pid` beside this script, and that process gains 100 ms per call
 const FAKE_IOREG: &str = r#"#!/bin/sh
 state="$(dirname "$0")/ioreg.calls"
 n=$(cat "$state" 2>/dev/null || echo 0)
@@ -64,6 +65,16 @@ cat <<END
       }
 END
 fi
+bench=$(cat "$(dirname "$0")/bench.pid" 2>/dev/null)
+if [ -n "$bench" ]; then
+cat <<END
+  +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1000012bc, !registered, !matched, active, busy 0, retain 5>
+      {
+        "AppUsage" = ({"API"="Metal","lastSubmittedTime"=1,"accumulatedGPUTime"=$((n * 100000000))})
+        "IOUserClientCreator" = "pid $bench, gpu bench"
+      }
+END
+fi
 if [ -n "$FAKE_GPU_BUSY" ]; then
 cat <<END
   +-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1000012b4, !registered, !matched, active, busy 0, retain 5>
@@ -88,21 +99,48 @@ const FAKE_BUSY: &str = "of the arm: 4242 other job ";
 #[cfg(not(target_os = "macos"))]
 const FAKE_BUSY: &str = "4242 /usr/bin/other job";
 
+/// What a fake bench does before it writes its output
+#[derive(Clone, Copy)]
+enum Work<'a> {
+    /// Nothing, so the arm takes a few milliseconds
+    Instant,
+    /// Half a second without the GPU
+    Cpu,
+    /// Half a second on the fake GPU in a child process, which writes its pid to this file
+    /// and closes its client before the bench exits, as a real GPU bench's worker does
+    Gpu(&'a Path),
+}
+
 /// A bench whose metric is `base` plus a small wobble from a shared counter, and whose
 /// output file holds `text`
-fn bench_script(base: &str, text: &str) -> String {
+fn bench_script(base: &str, text: &str, work: Work) -> String {
+    let work = match work {
+        Work::Instant => String::new(),
+        Work::Cpu => "sleep 0.5\n".to_owned(),
+        Work::Gpu(pid_file) => {
+            let f = pid_file.display();
+            format!("sh -c 'echo $$ > \"{f}\"; sleep 0.5'\nrm -f \"{f}\"\n")
+        }
+    };
     format!(
         r#"#!/bin/sh
 set -e
 out=$1
 n=$(cat "$COUNTER" 2>/dev/null || echo 0)
 echo $((n + 1)) > "$COUNTER"
-echo "{text}" > "$out/result.txt"
+{work}echo "{text}" > "$out/result.txt"
 echo "loading model"
 echo "time: {base}$((n % 3)) s"
 "#
     )
 }
+
+/// Each fake bench's file name, metric base and output
+const BENCHES: [(&str, &str, &str); 3] = [
+    ("ctl.sh", "10.0", "speaker A 0.00 1.50"),
+    ("fast.sh", "9.5", "speaker A 0.00 1.50"),
+    ("broken.sh", "9.5", "speaker B 0.00 1.50"),
+];
 
 const ADAPTER: &str = r#"
 name = "fake"
@@ -131,9 +169,9 @@ impl Fixture {
         fs::create_dir(root.join("fakebin")).unwrap();
         write_exec(&root.join("fakebin/nvidia-smi"), FAKE_SMI);
         write_exec(&root.join("fakebin/ioreg"), FAKE_IOREG);
-        write_exec(&root.join("ctl.sh"), &bench_script("10.0", "speaker A 0.00 1.50"));
-        write_exec(&root.join("fast.sh"), &bench_script("9.5", "speaker A 0.00 1.50"));
-        write_exec(&root.join("broken.sh"), &bench_script("9.5", "speaker B 0.00 1.50"));
+        for (name, base, text) in BENCHES {
+            write_exec(&root.join(name), &bench_script(base, text, Work::Instant));
+        }
         fs::write(
             root.join("adapter.toml"),
             ADAPTER.replace("REPO", root.to_str().unwrap()),
@@ -147,6 +185,19 @@ impl Fixture {
 
     fn path(&self, name: &str) -> PathBuf {
         self.root.join(name)
+    }
+
+    /// Makes the named benches use the fake GPU themselves
+    fn use_gpu(&self, names: &[&str]) {
+        let pid_file = self.path("fakebin/bench.pid");
+        self.set_work(names, Work::Gpu(&pid_file));
+    }
+
+    fn set_work(&self, names: &[&str], work: Work) {
+        for name in names {
+            let (_, base, text) = BENCHES.iter().find(|b| b.0 == *name).unwrap();
+            write_exec(&self.path(name), &bench_script(base, text, work));
+        }
     }
 
     /// Runs gpu-ab with `env` on top, such as `FAKE_GPU_BUSY` for the fake GPU tools
@@ -389,6 +440,7 @@ fn failing_gate_is_refused_even_without_a_hash() {
 #[test]
 fn other_gpu_process_invalidates_arms() {
     let fx = Fixture::new();
+    fx.use_gpu(&["ctl.sh", "fast.sh"]);
     let (out, result) = fx.prepare_and_run(
         "busy",
         &["--exp", "fast.sh", "--noise", "0.2%"],
@@ -412,10 +464,74 @@ fn other_gpu_process_invalidates_arms() {
 #[test]
 fn unmeasurable_gpu_use_invalidates_arms() {
     let fx = Fixture::new();
+    fx.use_gpu(&["ctl.sh"]);
     let (out, result) = fx.prepare_and_run("drop", &["--aa"], &[("FAKE_GPU_DROP", "1")]);
     assert!(out.status.success());
     let arms = result["arms"].as_array().unwrap();
     assert!(arms.iter().all(|a| a["valid"] == false));
     let reason = arms[0]["invalid_reason"].as_str().unwrap();
     assert!(reason.contains("can't be measured: 5151 queue closer"), "{reason}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn other_gpu_users_count_only_against_arms_that_used_the_gpu() {
+    let fx = Fixture::new();
+    // a CPU-only control against an experiment that uses the GPU, while another process
+    // keeps the GPU busy: only the experiment's arms can be slowed by it
+    fx.set_work(&["ctl.sh"], Work::Cpu);
+    fx.use_gpu(&["fast.sh"]);
+    let (out, result) = fx.prepare_and_run(
+        "mixed",
+        &["--exp", "fast.sh", "--noise", "0.2%"],
+        &[("FAKE_GPU_BUSY", "1")],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for arm in result["arms"].as_array().unwrap() {
+        let apple = &arm["apple"];
+        assert!(apple["other_share"].as_f64().unwrap() >= 0.01, "{apple}");
+        let own = apple["own_share"].as_f64().unwrap();
+        if arm["slot"]["arm"] == "control" {
+            assert_eq!(own, 0.0, "{arm}");
+            assert_eq!(arm["valid"], true, "{arm}");
+        } else {
+            assert!(own > 0.01, "the experiment's own GPU time was read: {apple}");
+            assert!(arm["invalid_reason"].as_str().unwrap().contains(FAKE_BUSY), "{arm}");
+        }
+    }
+    assert_eq!(result["verdict"]["decision"], "INCONCLUSIVE");
+
+    // with neither arm on the GPU, the same busy GPU leaves every arm valid, and the log
+    // says why
+    let fx = Fixture::new();
+    fx.set_work(&["ctl.sh", "fast.sh"], Work::Cpu);
+    let (out, result) = fx.prepare_and_run(
+        "cpu",
+        &["--exp", "fast.sh", "--noise", "0.2%"],
+        &[("FAKE_GPU_BUSY", "1")],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let arms = result["arms"].as_array().unwrap();
+    assert!(arms.iter().all(|a| a["valid"] == true), "{}", result["arms"]);
+    assert_eq!(result["verdict"]["decision"], "ACCEPT", "{}", result["verdict"]);
+    let log = fs::read_to_string(fx.path("cpu/LOG-entry.md")).unwrap();
+    assert!(
+        log.contains("14 arms used no GPU, so other GPU users didn't count against them"),
+        "{log}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn arm_too_short_to_sample_is_checked_as_a_gpu_arm() {
+    // an arm that ends before the first reading of its own clients can't show it used no
+    // GPU, so other GPU users still count against it
+    let fx = Fixture::new();
+    let (out, result) = fx.prepare_and_run("short", &["--aa"], &[("FAKE_GPU_BUSY", "1")]);
+    assert!(out.status.success());
+    let arms = result["arms"].as_array().unwrap();
+    assert!(
+        arms.iter()
+            .all(|a| a["valid"] == false && a["apple"]["own_share"].is_null())
+    );
 }

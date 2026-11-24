@@ -12,8 +12,17 @@
 //! `ioreg` readings around it, from the difference in their GPU time. WindowServer is
 //! recorded but exempt: it composites the display all the time, and the apps that make
 //! it work hard have GPU clients of their own
+//!
+//! The check guards GPU arms only. A [`BenchSampler`] reads the bench's own clients while
+//! the arm runs, since they close when the bench exits, before the second reading; an arm
+//! whose bench used under [`OWN_GPU_IDLE_SHARE`] of the GPU can't be slowed by other GPU
+//! users, so their use is recorded but doesn't invalidate it
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::mpsc,
+    thread::JoinHandle,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +30,64 @@ use serde::{Deserialize, Serialize};
 /// arm is invalid
 pub const OTHER_GPU_MAX_SHARE: f64 = 0.01;
 
+/// Largest share of an arm the bench's own processes may spend on the GPU while the arm
+/// still counts as using none, which exempts it from [`OTHER_GPU_MAX_SHARE`]
+pub const OWN_GPU_IDLE_SHARE: f64 = 0.001;
+
 /// The display compositor, recorded separately and exempt from [`OTHER_GPU_MAX_SHARE`]
 pub const WINDOW_SERVER: &str = "WindowServer";
+
+/// The bench's own Metal clients, read while its arm ran
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BenchClients {
+    /// The bench and each of its descendants seen with a Metal client
+    pub pids: BTreeSet<u32>,
+    /// Latest GPU time read for each of their clients, by registry id
+    pub gpu_time_ns: BTreeMap<u64, u64>,
+    /// Whether the clients were read at least once during the arm; without a reading the
+    /// bench's own use is unknown, and the arm is checked as a GPU arm
+    pub sampled: bool,
+}
+
+/// Reads the bench's Metal clients from `ioreg` while its arm runs: after 100 ms, then at
+/// doubling intervals up to once a second. Each reading takes about 20 ms of one core, the
+/// same in both arms
+///
+/// A client closes when its process exits, which is before the reading after the arm, so
+/// only readings taken during the arm see the bench's own GPU time. GPU work in the last
+/// interval before the bench exits is missed, which can't hide a GPU arm: one that used
+/// the GPU only in its final second spent too little of it to be slowed much
+pub struct BenchSampler {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<BenchClients>>,
+}
+
+impl BenchSampler {
+    /// Starts reading the clients of process `bench_pid` and its descendants; on NVIDIA
+    /// hosts it reads nothing
+    pub fn start(bench_pid: u32) -> Self {
+        let (stop, stopped) = mpsc::channel();
+        #[cfg(target_os = "macos")]
+        let thread = Some(std::thread::spawn(move || probe::watch_bench(bench_pid, &stopped)));
+        #[cfg(not(target_os = "macos"))]
+        let thread = {
+            let _ = (bench_pid, stopped);
+            None
+        };
+
+        Self {
+            stop: Some(stop),
+            thread,
+        }
+    }
+
+    /// Stops reading and returns what was read
+    pub fn finish(mut self) -> BenchClients {
+        // closing the channel wakes the thread, which returns after any reading in flight
+        self.stop.take();
+        self.thread.take().and_then(|t| t.join().ok()).unwrap_or_default()
+    }
+}
 
 /// Apple GPU readings at one instant
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +139,10 @@ pub struct AppleArm {
     /// Those processes, busiest first
     pub others: Vec<ClientUse>,
     pub window_server_share: f64,
+    /// The bench's own GPU time, read during the arm, as a share of the same time; absent
+    /// when it wasn't read
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_share: Option<f64>,
     /// Share of the arm the GPU spent out of its off state
     pub gpu_active_share: Option<f64>,
     /// Mean GPU frequency while active, weighted by residency
@@ -102,8 +171,8 @@ pub struct ClientUse {
 }
 
 impl AppleArm {
-    /// Compares the snapshots around an arm that ran for `wall_s` seconds as process
-    /// `bench_pid`; `pstates_mhz` is the environment's P-state table
+    /// Compares the snapshots around an arm that ran for `wall_s` seconds, whose own clients
+    /// were read as `bench`; `pstates_mhz` is the environment's P-state table
     ///
     /// Shares and power are over the time between the readings, which is a little longer
     /// than the arm; `wall_s` stands in when a reading has no timestamp
@@ -111,7 +180,7 @@ impl AppleArm {
         before: &AppleState,
         after: &AppleState,
         wall_s: f64,
-        bench_pid: Option<u32>,
+        bench: &BenchClients,
         pstates_mhz: Option<&[f64]>,
     ) -> Self {
         // in ns, so a share is one division of whole nanoseconds: summing rounded
@@ -124,11 +193,22 @@ impl AppleArm {
         let ioreport_s = window_ns(before.ioreport_read_ns, after.ioreport_read_ns) / 1e9;
 
         let start: BTreeMap<u64, u64> = before.clients.iter().map(|c| (c.id, c.gpu_time_ns)).collect();
+        // the bench's clients that outlived it are in the second reading too
+        let mut own = bench.gpu_time_ns.clone();
+        for c in after.clients.iter().filter(|c| bench.pids.contains(&c.pid)) {
+            let latest = own.entry(c.id).or_default();
+            *latest = (*latest).max(c.gpu_time_ns);
+        }
+        let own_ns: u64 = own
+            .iter()
+            .map(|(id, ns)| ns.saturating_sub(start.get(id).copied().unwrap_or(0)))
+            .sum();
+
         let mut by_pid: BTreeMap<u32, (String, u64)> = BTreeMap::new();
         let mut unmeasured: Vec<GpuProcess> = Vec::new();
         let mut window_server_ns = 0;
         for c in &after.clients {
-            if Some(c.pid) == bench_pid {
+            if bench.pids.contains(&c.pid) {
                 continue;
             }
 
@@ -197,6 +277,7 @@ impl AppleArm {
             other_share: other_ns as f64 / clients_ns,
             others,
             window_server_share,
+            own_share: bench.sampled.then(|| own_ns as f64 / clients_ns),
             gpu_active_share,
             gpu_mean_mhz,
             gpu_power_w: power(before.gpu_energy_j, after.gpu_energy_j),
@@ -205,8 +286,21 @@ impl AppleArm {
         }
     }
 
+    /// Whether the bench used the GPU itself: its own share is at least
+    /// [`OWN_GPU_IDLE_SHARE`], or wasn't read
+    pub fn used_gpu(&self) -> bool {
+        self.own_share.is_none_or(|s| s >= OWN_GPU_IDLE_SHARE)
+    }
+
     /// Why the arm doesn't count, if other processes used the GPU too much during it
+    ///
+    /// Only an arm that used the GPU itself can be invalid: other processes' GPU use can't
+    /// slow an arm that used none, so for one it is only recorded
     pub fn invalid_reason(&self) -> Option<String> {
+        if !self.used_gpu() {
+            return None;
+        }
+
         if !self.unmeasured.is_empty() {
             let procs: Vec<String> = self
                 .unmeasured
@@ -248,7 +342,16 @@ pub(super) use probe::{environment, snapshot};
 
 #[cfg(test)]
 mod tests {
-    use super::{AppleArm, AppleState, GpuClient};
+    use super::{AppleArm, AppleState, BenchClients, GpuClient};
+
+    /// A bench read during its arm that spent 500 ms of it on the GPU as pid 99
+    fn gpu_arm() -> BenchClients {
+        BenchClients {
+            pids: [99].into(),
+            gpu_time_ns: [(99, 500_000_000)].into(),
+            sampled: true,
+        }
+    }
 
     fn client(id: u64, pid: u32, gpu_time_ns: u64, last_submitted_ns: u64) -> GpuClient {
         GpuClient {
@@ -287,12 +390,37 @@ mod tests {
                 client(3, 3, 3_333_333, 1),
             ],
         );
-        let arm = AppleArm::between(&before, &after, 1.0, None, None);
+        let arm = AppleArm::between(&before, &after, 1.0, &gpu_arm(), None);
         assert!(arm.invalid_reason().is_some(), "{arm:?}");
 
         let after = state(1_000_000_000, vec![client(1, 1, 9_999_999, 1)]);
-        let arm = AppleArm::between(&before, &after, 1.0, None, None);
+        let arm = AppleArm::between(&before, &after, 1.0, &gpu_arm(), None);
         assert_eq!(arm.invalid_reason(), None);
+    }
+
+    #[test]
+    fn other_gpu_users_count_only_against_gpu_arms() {
+        let before = state(0, vec![client(1, 7, 0, 0)]);
+        // another process used 5% of a 1 s arm, and the bench's own client has closed
+        let after = state(1_000_000_000, vec![client(1, 7, 50_000_000, 1)]);
+        let cpu_arm = BenchClients {
+            pids: [99].into(),
+            sampled: true,
+            ..BenchClients::default()
+        };
+        let arm = AppleArm::between(&before, &after, 1.0, &cpu_arm, None);
+        assert_eq!(arm.own_share, Some(0.0));
+        assert!((arm.other_share - 0.05).abs() < 1e-9, "{arm:?}");
+        assert_eq!(arm.invalid_reason(), None);
+
+        let arm = AppleArm::between(&before, &after, 1.0, &gpu_arm(), None);
+        assert_eq!(arm.own_share, Some(0.5));
+        assert!(arm.invalid_reason().is_some_and(|r| r.contains("5.0% of the arm")));
+
+        // unread, the bench's own use is unknown and the arm is checked
+        let arm = AppleArm::between(&before, &after, 1.0, &BenchClients::default(), None);
+        assert_eq!(arm.own_share, None);
+        assert!(arm.invalid_reason().is_some());
     }
 
     #[test]
@@ -301,24 +429,29 @@ mod tests {
         // submitted during the arm, so its use is unknown rather than zero
         let before = state(100, vec![client(1, 7, 1_000_000_000, 50)]);
         let after = state(1_000_000_100, vec![client(1, 7, 40_000_000, 500)]);
-        let arm = AppleArm::between(&before, &after, 1.0, None, None);
+        let arm = AppleArm::between(&before, &after, 1.0, &gpu_arm(), None);
         assert!(arm.invalid_reason().is_some_and(|r| r.contains("can't be measured")));
 
         // the same drop with nothing submitted since the first reading is harmless
         let after = state(1_000_000_100, vec![client(1, 7, 40_000_000, 50)]);
-        let arm = AppleArm::between(&before, &after, 1.0, None, None);
+        let arm = AppleArm::between(&before, &after, 1.0, &gpu_arm(), None);
         assert_eq!(arm.invalid_reason(), None);
     }
 }
 
 #[cfg(target_os = "macos")]
 mod probe {
-    use std::process::Command;
+    use std::{
+        collections::BTreeMap,
+        process::Command,
+        sync::mpsc::{Receiver, RecvTimeoutError},
+        time::Duration,
+    };
 
     use eyre::{Result, WrapErr, bail};
     use regex::Regex;
 
-    use super::{AppleState, GpuClient};
+    use super::{AppleState, BenchClients, GpuClient};
     use crate::{
         gpu::{Environment, GpuInfo, GpuSnapshot, ioreport},
         time::now_ct,
@@ -392,6 +525,70 @@ mod probe {
                 clients,
             })
         }
+    }
+
+    /// Reads the clients of `bench_pid` and its descendants until `stop` closes, for
+    /// [`super::BenchSampler`]
+    pub(super) fn watch_bench(bench_pid: u32, stop: &Receiver<()>) -> BenchClients {
+        let mut bench = BenchClients {
+            pids: [bench_pid].into(),
+            ..BenchClients::default()
+        };
+        // whether each pid seen descends from the bench; a process can't gain an ancestor
+        let mut descends: BTreeMap<u32, bool> = BTreeMap::new();
+        let mut wait = Duration::from_millis(100);
+        while let Err(RecvTimeoutError::Timeout) = stop.recv_timeout(wait) {
+            wait = (wait * 2).min(Duration::from_secs(1));
+            let Ok(acc) = Accelerator::read() else {
+                continue;
+            };
+
+            bench.sampled = true;
+            for c in acc.clients {
+                if !*descends.entry(c.pid).or_insert_with(|| descends_from(c.pid, bench_pid)) {
+                    continue;
+                }
+
+                bench.pids.insert(c.pid);
+                let latest = bench.gpu_time_ns.entry(c.id).or_default();
+                *latest = (*latest).max(c.gpu_time_ns);
+            }
+        }
+
+        bench
+    }
+
+    /// Whether `pid` is `ancestor` or one of its descendants
+    fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+        // a bound on the walk in case a parent can't be read consistently
+        for _ in 0..64 {
+            if pid == ancestor {
+                return true;
+            }
+
+            match parent_pid(pid) {
+                Some(parent) if parent > 1 && parent != pid => pid = parent,
+                _ => return false,
+            }
+        }
+
+        false
+    }
+
+    fn parent_pid(pid: u32) -> Option<u32> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes at most `size` bytes into the struct it is given
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        (n == size).then_some(info.pbi_ppid)
     }
 
     pub(in crate::gpu) fn snapshot() -> Result<GpuSnapshot> {
