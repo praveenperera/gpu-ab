@@ -4,7 +4,7 @@ members = ["crates/gpu-ab-core", "crates/gpu-ab", "xtask"]
 default-members = ["crates/gpu-ab-core", "crates/gpu-ab"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/praveenperera/gpu-ab"
